@@ -594,6 +594,13 @@ class Photo:
 
     @classmethod
     def process_photo(cls, external_path, photo, filename, slug, output_path, people_q: Queue):
+        photo_obj, largest_src = cls._process_photo_data(external_path, photo, filename, slug, output_path)
+        if Config.instance().people_enabled:
+            people_q.put((photo_obj, photo, largest_src, output_path, external_path))
+        return photo_obj
+
+    @classmethod
+    def _process_photo_data(cls, external_path, photo, filename, slug, output_path):
         new_original_photo = os.path.join(
             output_path, "original_%s%s" % (os.path.basename(slug), extract_extension(photo))
         )
@@ -691,41 +698,25 @@ class Photo:
         )
         photo_obj.exif = exif_data
 
-        # Faces
-        if Config.instance().people_enabled:
-            # Use original photo file for face detection to preserve all metadata
-            people_q.put(
-                (
-                    photo_obj,
-                    photo,  # Use original photo instead of new_original_photo
-                    largest_src,
-                    output_path,
-                    external_path,
-                )
-            )
-
-        return photo_obj
+        return photo_obj, largest_src
 
 
 def _process_photo(t):
     (external_path, photo_file, filename, unique_slug, album_folder) = t
     print(f" --> Processing [magenta]{photo_file}[/magenta]...")
     try:
-        return (
-            photo_file,
-            Photo.process_photo(
-                external_path, photo_file, filename, unique_slug, album_folder, _process_photo.people_q
-            ),
+        photo_obj, largest_src = Photo._process_photo_data(
+            external_path, photo_file, filename, unique_slug, album_folder
         )
+        return photo_file, photo_obj, largest_src
     except PhotoProcessingFailure as e:
         print(
             f"[yellow]Skipping processing of image file[/yellow] [magenta]{photo_file}[/magenta] Reason: [red]{str(e)}[/red]"
         )
-        return (photo_file, None)
+        return (photo_file, None, None)
 
 
-def _proces_photo_init(people_q, yaml_config):
-    _process_photo.people_q = people_q
+def _proces_photo_init(yaml_config):
     # Re-initialize Config in worker process
     Config.init(yaml_config)
 
@@ -804,12 +795,11 @@ class Albums:
 
         print(f"Found [cyan]{len(jobs)}[/cyan] photos to process")
         results = []
-        people_q = Queue()
         if len(jobs) > 0:
             with Pool(
                 processes=Config.instance().parallel_tasks,
                 initializer=_proces_photo_init,
-                initargs=[people_q, yaml_config],
+                initargs=[yaml_config],
             ) as P:
                 results = P.map(_process_photo, jobs)
         else:
@@ -817,23 +807,12 @@ class Albums:
 
         people = People.instance()
         print("Detecting Faces...")
-        # Create a mapping from photo slug to photo object for face detection
-        photo_by_slug = {}
-        for photo_file, result in results:
+        # Pool.map waits for every result, including the paths needed for face detection.
+        # A separate multiprocessing.Queue could lose buffered items when workers terminate.
+        for photo_file, result, largest_src in results:
             if result is not None:
-                photo_by_slug[result.slug] = result
-
-        # Process face detection and update the photo objects in results
-        while not people_q.empty():
-            (photo_obj, new_original_photo, largest_src, output_path, external_path) = people_q.get()
-            # Find the corresponding photo object in results by matching slug
-            # The photo_obj from queue might be a different instance due to multiprocessing
-            if photo_obj.slug in photo_by_slug:
-                actual_photo = photo_by_slug[photo_obj.slug]
-                people.detect_faces(actual_photo, new_original_photo, largest_src, output_path, external_path)
-
-        for photo_file, result in results:
-            if result is not None:
+                if Config.instance().people_enabled:
+                    people.detect_faces(result, photo_file, largest_src, album_folder, external_path)
                 album_obj.add_photo(result)
 
         if len(album_obj.photos) > 0:
